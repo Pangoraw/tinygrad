@@ -190,6 +190,7 @@ def riski_load(target, address, stride_y=SZ, stride_x=1, len_y=SZ, len_x=SZ):
   d = regfile[target]
   d[:] = 0
   d[:len_y, :len_x] = np.lib.stride_tricks.as_strided(sram[address:], (len_y, len_x), (stride_y*4, stride_x*4))
+  # print(d[:len_y, :len_x])
   """
   for y in range(0, len_y):
     for x in range(0, len_x):
@@ -231,34 +232,54 @@ def cherry_reduceop(x, op, axis):
 
   if isinstance(axis, int): axis = [axis]
 
-  def reduce_in_sram(src, dst, shape, stride_y, stride_x=1, transpose=False):
+  def reduce_in_sram(src, dst, shape, transpose=False, hop=1):
     M = shape[int(transpose)]
     K = shape[1]
     size_after_reduction = M // SZ + int(M % SZ != 0)
     for idy, dy in enumerate(range(0, shape[0], SZ)):
       for idx, dx in enumerate(range(0, shape[1], SZ)):
-        offset = dy * K + dx
+        offset = dy * K * hop + dx * hop
         ny = min(shape[0] - dy, SZ)
         nx = min(shape[1] - dx, SZ)
 
         riski_load(Reg.MATMUL_INPUT, src+offset, 
-                   stride_y=(K if not transpose else 1), stride_x=(1 if not transpose else M), len_y=(ny if not transpose else nx), len_x=(nx if not transpose else ny))
+                   stride_y=(K * hop if not transpose else hop), stride_x=(hop if not transpose else M * hop),
+                   len_y=(ny if not transpose else nx), len_x=(nx if not transpose else ny))
         reduceops[op]()
-        out_offset = (idy*stride_y if not transpose else dy*size_after_reduction) + (dx*stride_x if not transpose else idx)
+        out_offset = (idy*K*hop if not transpose else dy*hop*size_after_reduction) + (dx*hop if not transpose else idx*hop)
         riski_store(Reg.MATMUL_OUTPUT, dst+out_offset,
-            len_y=1, len_x=(nx if not transpose else ny), stride_x=size_after_reduction if transpose else 1)
+            len_y=1, len_x=(nx if not transpose else ny), stride_x=size_after_reduction if transpose else hop)
 
-  M, K = x.shape
+  def mat_reduce(src, dst, shape, transpose, hop):
+    # 2d reduce on axis 0, use tranpose=True to get axis=1
+    M, K = shape
+    stride_x, stride_y = (1, K) if not transpose else (K, 1)
 
-  # 2x2 reduce axis=0/1
-  for ax in axis:
-    stride_x, stride_y = (1, K) if ax == 0 else (K, 1)
-    reduce_in_sram(SLOT(0), SLOT(2), (M, K),
-        stride_y, stride_x, ax==1)
-    next_size = M // SZ + int(M % SZ != 0)
-    if next_size > 1: # for x where n_axis > 32
-      reduce_in_sram(SLOT(2), SLOT(2), (next_size, K) if ax == 0 else (K, next_size),
-          stride_y, stride_x, ax==1)
+    reduce_in_sram(src, dst, (M, K), transpose, hop)
+    reduced_dim = K if transpose else M
+    next_size = reduced_dim // SZ + int(reduced_dim % SZ != 0)
+    while next_size > 1: # for x where n_axis > 32^n
+      reduce_in_sram(dst, dst, (next_size, K) if not transpose else (K, next_size), transpose, hop)
+      next_size = next_size // SZ + int(next_size % SZ != 0)
+
+  for ax in map(int, axis):
+    target_shape = x.shape[ax:ax+2]
+    iter_dim = ax+2 if ax+2 < len(x.shape) else ax-1
+    transpose = False
+    if ax == len(x.shape) - 1:
+      target_shape = x.shape[ax-1:ax+1]
+      transpose = True
+      iter_dim = ax - 2
+
+    if len(x.shape) == 2:
+      mat_reduce(SLOT(0), SLOT(2), target_shape, transpose, int(np.prod(x.shape[ax+2:])))
+    else:
+      for j in range(x.shape[iter_dim]):
+        mat_reduce(
+            SLOT(0) + j * int(np.prod(x.shape[iter_dim+1:])),
+            SLOT(2) + j * (target_shape[1-int(transpose)] if iter_dim != len(x.shape)-1 else 1),
+            target_shape,
+            transpose, int(np.prod(x.shape[ax+2:])))
 
   osize = tuple(d for i, d in enumerate(x.shape) if i not in axis)
   return cherry_dmaw(SLOT(2), osize)
@@ -432,9 +453,37 @@ class TestCherry(unittest.TestCase):
     x = np.random.uniform(size=(79, 47)).astype(np.float32)
     np.testing.assert_allclose(x.sum(axis=0), cherry_reduceop(x, ReduceOps.SUM, 0), rtol=1e-5)
 
+  def test_reduce_sum_3d(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.sum(axis=0), cherry_reduceop(x, ReduceOps.SUM, 0), rtol=1e-5)
+
+  def test_reduce_sum_3d_transpose(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.sum(axis=1), cherry_reduceop(x, ReduceOps.SUM, 1), rtol=1e-5)
+
+  def test_reduce_sum_3d_last_axis(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.sum(axis=2), cherry_reduceop(x, ReduceOps.SUM, 2), rtol=1e-5)
+
   def test_reduce_max(self):
     x = np.random.uniform(size=(33, 33)).astype(np.float32)
     np.testing.assert_allclose(x.max(axis=1), cherry_reduceop(x, ReduceOps.MAX, 1), rtol=1e-5)
+
+  def test_reduce_max_big_matrix(self):
+    x = np.random.uniform(size=(SZ * SZ + 2, SZ)).astype(np.float32)
+    np.testing.assert_allclose(x.max(axis=0), cherry_reduceop(x, ReduceOps.MAX, 0), rtol=1e-5)
+
+  def test_reduce_max_3d(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.max(axis=0), cherry_reduceop(x, ReduceOps.MAX, 0), rtol=1e-5)
+
+  def test_reduce_max_3d_transpose(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.max(axis=1), cherry_reduceop(x, ReduceOps.MAX, 1), rtol=1e-5)
+
+  def test_reduce_max_3d_last_axis(self):
+    x = np.random.uniform(size=(30, 20, 40)).astype(np.float32)
+    np.testing.assert_allclose(x.max(axis=2), cherry_reduceop(x, ReduceOps.MAX, 2), rtol=1e-5)
 
 if __name__ == "__main__":
   np.random.seed(1337)
