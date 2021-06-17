@@ -229,7 +229,39 @@ def cherry_reduceop(x, op, axis):
   print(op, x.shape, axis)
   cherry_dmar(SLOT(0), x)
 
-  return cherry_dmaw(SLOT(2), x.shape)
+  if isinstance(axis, int): axis = [axis]
+
+  def reduce_in_sram(src, dst, shape, stride_y, stride_x=1, transpose=False):
+    M = shape[int(transpose)]
+    K = shape[1]
+    size_after_reduction = M // SZ + int(M % SZ != 0)
+    for idy, dy in enumerate(range(0, shape[0], SZ)):
+      for idx, dx in enumerate(range(0, shape[1], SZ)):
+        offset = dy * K + dx
+        ny = min(shape[0] - dy, SZ)
+        nx = min(shape[1] - dx, SZ)
+
+        riski_load(Reg.MATMUL_INPUT, src+offset, 
+                   stride_y=(K if not transpose else 1), stride_x=(1 if not transpose else M), len_y=(ny if not transpose else nx), len_x=(nx if not transpose else ny))
+        reduceops[op]()
+        out_offset = (idy*stride_y if not transpose else dy*size_after_reduction) + (dx*stride_x if not transpose else idx)
+        riski_store(Reg.MATMUL_OUTPUT, dst+out_offset,
+            len_y=1, len_x=(nx if not transpose else ny), stride_x=size_after_reduction if transpose else 1)
+
+  M, K = x.shape
+
+  # 2x2 reduce axis=0/1
+  for ax in axis:
+    stride_x, stride_y = (1, K) if ax == 0 else (K, 1)
+    reduce_in_sram(SLOT(0), SLOT(2), (M, K),
+        stride_y, stride_x, ax==1)
+    next_size = M // SZ + int(M % SZ != 0)
+    if next_size > 1: # for x where n_axis > 32
+      reduce_in_sram(SLOT(2), SLOT(2), (next_size, K) if ax == 0 else (K, next_size),
+          stride_y, stride_x, ax==1)
+
+  osize = tuple(d for i, d in enumerate(x.shape) if i not in axis)
+  return cherry_dmaw(SLOT(2), osize)
 
 def cherry_unop(x, op):
   cherry_dmar(SLOT(0), x)
@@ -391,6 +423,18 @@ class TestCherry(unittest.TestCase):
     x = np.random.uniform(size=(79, 47)).astype(np.float32)
     w = np.random.uniform(size=(79, 42)).astype(np.float32)
     np.testing.assert_allclose(x.T @ w, cherry_matmul(x, w, transpose_x=True), rtol=1e-5)
+
+  def test_reduce_sum(self):
+    x = np.random.uniform(size=(33, 33)).astype(np.float32)
+    np.testing.assert_allclose(x.sum(axis=0), cherry_reduceop(x, ReduceOps.SUM, 0), rtol=1e-5)
+
+  def test_reduce_sum_uneven(self):
+    x = np.random.uniform(size=(79, 47)).astype(np.float32)
+    np.testing.assert_allclose(x.sum(axis=0), cherry_reduceop(x, ReduceOps.SUM, 0), rtol=1e-5)
+
+  def test_reduce_max(self):
+    x = np.random.uniform(size=(33, 33)).astype(np.float32)
+    np.testing.assert_allclose(x.max(axis=1), cherry_reduceop(x, ReduceOps.MAX, 1), rtol=1e-5)
 
 if __name__ == "__main__":
   np.random.seed(1337)
